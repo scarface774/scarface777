@@ -23,7 +23,11 @@ const OI_HISTORY_MAX_POINTS = 120;
 const LS = {
   favorites: 'gasp_fav_v2',
   settings:  'gasp_set_v2',
+  history:   'gasp_hist_v1',  // буфер истории цен — переживает перезагрузку
 };
+
+// Как часто сохраняем буфер в localStorage (не каждый тик — это дорого)
+const HISTORY_SAVE_INTERVAL_MS = 30 * 1000;
 
 // ---- state ---------------------------------------------------------------
 const state = {
@@ -47,12 +51,14 @@ const state = {
   colTFs: ['m1','m5','h1','h24'],
   coins: new Map(),
   history: new Map(),
+  funding: new Map(),  // key -> {rate, nextTime}
+  lsRatio: new Map(),  // key -> {longPct, shortPct}
   alerts: [],
   lastErrors: {},
   liveExchanges: new Set(),
 };
 
-loadSettings(); loadFavorites();
+loadSettings(); loadFavorites(); loadHistory();
 
 // ---- DOM -----------------------------------------------------------------
 const $ = id => document.getElementById(id);
@@ -159,8 +165,92 @@ async function loadOKX() {
 }
 
 // ============================================================================
-// KLINES — для модального графика
+// FUNDING RATE + LONG/SHORT RATIO
 // ============================================================================
+
+// Binance Funding Rate — батч топ-60 по объёму
+async function loadBinanceFunding(symbols) {
+  const out = {};
+  await Promise.all(symbols.slice(0,60).map(async sym => {
+    try {
+      const r = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}USDT`);
+      if (!r.ok) return;
+      const j = await r.json();
+      out[sym] = { rate: +j.lastFundingRate * 100, nextTime: +j.nextFundingTime };
+    } catch(e) {}
+  }));
+  return out;
+}
+
+// Binance Long/Short ratio
+async function loadBinanceLSR(symbols) {
+  const out = {};
+  await Promise.all(symbols.slice(0,40).map(async sym => {
+    try {
+      const r = await fetch(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${sym}USDT&period=5m&limit=1`);
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j && j[0]) {
+        const longPct = +j[0].longAccount * 100;
+        out[sym] = { longPct, shortPct: 100 - longPct };
+      }
+    } catch(e) {}
+  }));
+  return out;
+}
+
+// Bybit Funding Rate
+async function loadBybitFunding(symbols) {
+  const out = {};
+  await Promise.all(symbols.slice(0,60).map(async sym => {
+    try {
+      const r = await fetch(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${sym}USDT`);
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.retCode === 0 && j.result.list[0]) {
+        out[sym] = { rate: +j.result.list[0].fundingRate * 100, nextTime: +j.result.list[0].nextFundingTime };
+      }
+    } catch(e) {}
+  }));
+  return out;
+}
+
+// OKX Funding Rate — один запрос на все SWAP
+async function loadOKXFunding() {
+  const out = {};
+  try {
+    const r = await fetch('https://www.okx.com/api/v5/public/funding-rate?instType=SWAP');
+    if (!r.ok) return out;
+    const j = await r.json();
+    if (j.code === '0') {
+      j.data.filter(d => d.instId.endsWith('-USDT-SWAP')).forEach(d => {
+        const sym = d.instId.replace('-USDT-SWAP','');
+        out[sym] = { rate: +d.fundingRate * 100, nextTime: +d.nextFundingTime };
+      });
+    }
+  } catch(e) {}
+  return out;
+}
+
+// Запускаем фоновую загрузку funding + L/S каждые 30 секунд (данные обновляются редко)
+async function refreshFundingAndLSR() {
+  const binSyms = [...state.coins.values()].filter(c=>c.exchange==='Binance').sort((a,b)=>b.volume-a.volume).slice(0,60).map(c=>c.symbol);
+  const bybSyms = [...state.coins.values()].filter(c=>c.exchange==='Bybit').sort((a,b)=>b.volume-a.volume).slice(0,60).map(c=>c.symbol);
+
+  const [binF, binLS, bybF, okxF] = await Promise.allSettled([
+    loadBinanceFunding(binSyms),
+    loadBinanceLSR(binSyms),
+    loadBybitFunding(bybSyms),
+    loadOKXFunding(),
+  ]);
+
+  if (binF.status==='fulfilled')  Object.entries(binF.value).forEach(([s,v])  => state.funding.set(keyFor('Binance',s),v));
+  if (binLS.status==='fulfilled') Object.entries(binLS.value).forEach(([s,v]) => state.lsRatio.set(keyFor('Binance',s),v));
+  if (bybF.status==='fulfilled')  Object.entries(bybF.value).forEach(([s,v])  => state.funding.set(keyFor('Bybit',s),v));
+  if (okxF.status==='fulfilled')  Object.entries(okxF.value).forEach(([s,v])  => state.funding.set(keyFor('OKX',s),v));
+
+  render();
+}
 async function fetchKlines(exchange, symbol, interval='15m', limit=100) {
   try {
     if (exchange==='Binance') {
@@ -244,6 +334,38 @@ function pushHistory(key,t,price,oi){
   arr.push({t,price,oi});
   const cut=t-HISTORY_MAX_MS;
   while(arr.length&&arr[0].t<cut)arr.shift();
+}
+
+// Сохраняем буфер в localStorage — только топ-200 монет по объёму (экономим место)
+function saveHistory() {
+  try {
+    const topKeys = [...state.coins.values()]
+      .sort((a,b) => b.volume - a.volume)
+      .slice(0, 200)
+      .map(c => c.key);
+    const obj = {};
+    topKeys.forEach(key => {
+      const arr = state.history.get(key);
+      if (arr && arr.length) obj[key] = arr.slice(-120); // последние 120 точек (~10 мин при 2с)
+    });
+    localStorage.setItem(LS.history, JSON.stringify(obj));
+  } catch(e) { /* quota exceeded — ignore */ }
+}
+
+// Загружаем буфер при старте
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(LS.history);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    const now = Date.now();
+    Object.entries(obj).forEach(([key, arr]) => {
+      // отбрасываем точки старше HISTORY_MAX_MS
+      const fresh = arr.filter(p => now - p.t < HISTORY_MAX_MS);
+      if (fresh.length) state.history.set(key, fresh);
+    });
+    console.log(`[GASP] Восстановлен буфер для ${state.history.size} монет`);
+  } catch(e) {}
 }
 
 function priceAt(key,now,ms){
@@ -414,7 +536,9 @@ function renderTableHead(){
   const staticRight=[
     {key:'volume',label:'Объём 24ч',idx:6},
     {key:'oi',   label:'OI',        idx:7},
-    {key:'spark', label:'График',   idx:8,nosort:true},
+    {key:'fund', label:'Funding',   idx:8, nosort:true},
+    {key:'ls',   label:'L/S',       idx:9, nosort:true},
+    {key:'spark', label:'График',   idx:10,nosort:true},
   ];
 
   const tfTh = state.colTFs.map((tf,i)=>{
@@ -537,7 +661,7 @@ function pctHtml(v){
 function render(){
   const list=getCoins();
   if(!list.length){
-    tbody.innerHTML=`<tr><td colspan="9"><div class="empty-state"><div class="big">∅</div>Нет монет под фильтры</div></td></tr>`;
+    tbody.innerHTML=`<tr><td colspan="11"><div class="empty-state"><div class="big">∅</div>Нет монет под фильтры</div></td></tr>`;
     footerNote.textContent=''; renderFavList(); populateOiSelect(list); return;
   }
   tbody.innerHTML=list.map(c=>{
@@ -550,6 +674,14 @@ function render(){
       return v!==null&&thresh>0&&Math.abs(v)>=thresh;
     });
     const spark=sparklineSVG(c.key);
+    const fund=state.funding.get(c.key);
+    const lsr=state.lsRatio.get(c.key);
+    const fundHtml = fund != null
+      ? `<span class="fund-rate ${fund.rate>0?'fund-pos':fund.rate<0?'fund-neg':'fund-zero'}">${fund.rate>=0?'+':''}${fund.rate.toFixed(4)}%</span>`
+      : `<span style="color:var(--text-2);font-size:11px">···</span>`;
+    const lsHtml = lsr
+      ? `<div class="ls-bar"><div class="ls-long" style="width:${lsr.longPct.toFixed(0)}%"></div></div><div class="ls-nums"><span class="ls-l">${lsr.longPct.toFixed(0)}%</span><span class="ls-s">${lsr.shortPct.toFixed(0)}%</span></div>`
+      : `<span style="color:var(--text-2);font-size:11px">···</span>`;
     return`<tr class="${flash} ${isHot?'hot-row':''}" data-key="${c.key}">
       <td><div class="sym-cell">
         <button class="star-btn ${isFav?'fav':''}" data-fav="${c.key}">★</button>
@@ -560,6 +692,8 @@ function render(){
       ${c.cols.map(v=>pctHtml(v)).map(h=>`<td>${h}</td>`).join('')}
       <td class="mono">$${(c.volume/1e6).toFixed(1)}M</td>
       <td class="mono">${c.oi>0?'$'+(c.oi/1e6).toFixed(1)+'M':'—'}</td>
+      <td class="fund-cell">${fundHtml}</td>
+      <td class="ls-cell">${lsHtml}</td>
       <td class="spark-cell chart-trigger" data-key="${c.key}">${spark}</td>
     </tr>`;
   }).join('');
@@ -881,6 +1015,24 @@ extraCSS.textContent=`
 .spark-cell:hover{opacity:.8;}
 .sym-name.chart-trigger{cursor:pointer;color:var(--acc);}
 .sym-name.chart-trigger:hover{text-decoration:underline;}
+
+/* Funding Rate */
+.fund-cell{text-align:right;padding:8px 10px;}
+.fund-rate{font-family:var(--font-mono);font-size:12px;font-weight:700;
+  padding:2px 6px;border-radius:4px;}
+.fund-pos{color:#ff5d5d;background:#ff5d5d18;}
+.fund-neg{color:#3ddc84;background:#3ddc8418;}
+.fund-zero{color:var(--text-2);}
+
+/* Long/Short ratio */
+.ls-cell{padding:6px 10px;min-width:90px;}
+.ls-bar{height:4px;border-radius:2px;background:#ff5d5d55;overflow:hidden;margin-bottom:3px;}
+.ls-long{height:100%;background:#3ddc84;border-radius:2px;transition:width .3s;}
+.ls-nums{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:10px;}
+.ls-l{color:#3ddc84;font-weight:700;}
+.ls-s{color:#ff5d5d;font-weight:700;}
+
+/* Modal */
 .modal-overlay{display:none;position:fixed;inset:0;background:#00000090;z-index:300;
   align-items:center;justify-content:center;padding:20px;}
 .modal-box{background:var(--bg-1);border:1px solid var(--line-strong);border-radius:14px;
@@ -909,3 +1061,10 @@ wireControls();
 render();
 refreshAll();
 scheduleRefresh();
+
+// Funding + L/S — сразу и потом каждые 30 секунд
+setTimeout(refreshFundingAndLSR, 3000);
+setInterval(refreshFundingAndLSR, 30000);
+
+// Автосохранение буфера истории каждые 30 секунд
+setInterval(saveHistory, HISTORY_SAVE_INTERVAL_MS);
