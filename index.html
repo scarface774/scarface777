@@ -387,7 +387,11 @@ input[type=range]::-webkit-slider-thumb{
 
     <div id="panelOi" style="display:none;">
       <div class="widget-title">Open Interest</div>
-      <select id="oiSymbolSelect" class="mono" style="width:100%;background:var(--bg-2);border:1px solid var(--line-strong);color:var(--text-0);border-radius:6px;padding:7px;margin-bottom:10px;font-size:12px;"></select>
+      <input id="oiSearch" type="text" placeholder="Поиск монеты... BTC, ETH"
+        style="width:100%;background:var(--bg-2);border:1px solid var(--line-strong);color:var(--text-0);
+        border-radius:6px;padding:7px 10px;margin-bottom:6px;font-size:12px;font-family:var(--font-mono);outline:none;">
+      <select id="oiSymbolSelect" class="mono" style="width:100%;background:var(--bg-2);border:1px solid var(--line-strong);color:var(--text-0);border-radius:6px;padding:7px;margin-bottom:8px;font-size:12px;"></select>
+      <div id="oiExactBox" style="margin-bottom:8px;"></div>
       <div class="oi-chart-wrap">
         <div class="oi-chart-sym" id="oiChartTitle">—</div>
         <svg id="oiSvg" viewBox="0 0 248 90" style="width:100%;height:90px;display:block;"></svg>
