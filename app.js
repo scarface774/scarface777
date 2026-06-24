@@ -116,21 +116,43 @@ function speakAlert(a) {
 // ============================================================================
 async function loadBinance() {
   try {
-    const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
+    // v2 ticker отдаёт openInterest и openInterestValue прямо в ответе — один запрос на все монеты
+    const r=await fetch('https://fapi.binance.com/fapi/v2/ticker/24hr');
     if(!r.ok) throw new Error(`HTTP ${r.status}`);
     const d=await r.json();
     return {ok:true,ex:'Binance',items:d.filter(x=>x.symbol.endsWith('USDT')).map(x=>({
       exchange:'Binance',symbol:x.symbol.replace(/USDT$/,''),
-      price:+x.lastPrice,change24h:+x.priceChangePercent,volume:+x.quoteVolume,oi:null
+      price:+x.lastPrice,change24h:+x.priceChangePercent,volume:+x.quoteVolume,
+      oi:+x.openInterestValue||0,  // v2 отдаёт OI в USD напрямую
     }))};
-  } catch(e){return{ok:false,ex:'Binance',error:e.message};}
+  } catch(e){
+    // fallback на v1 если v2 недоступен
+    try {
+      const r=await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d=await r.json();
+      return {ok:true,ex:'Binance',items:d.filter(x=>x.symbol.endsWith('USDT')).map(x=>({
+        exchange:'Binance',symbol:x.symbol.replace(/USDT$/,''),
+        price:+x.lastPrice,change24h:+x.priceChangePercent,volume:+x.quoteVolume,oi:0,
+      }))};
+    } catch(e2){return{ok:false,ex:'Binance',error:e2.message};}
+  }
 }
+
+// OI батч — теперь только для монет у которых OI всё ещё 0 после v2
 async function loadBinanceOI(syms) {
   const out={};
-  await Promise.all(syms.slice(0,60).map(async s=>{
-    try{const r=await fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${s}USDT`);
-      if(r.ok){const j=await r.json();out[s]=+j.openInterest||0;}}catch(e){}
-  }));
+  // Грузим батчами по 20 параллельно чтобы не перегружать API
+  const BATCH=20;
+  for(let i=0;i<syms.length;i+=BATCH){
+    const batch=syms.slice(i,i+BATCH);
+    await Promise.all(batch.map(async s=>{
+      try{
+        const r=await fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${s}USDT`);
+        if(r.ok){const j=await r.json();out[s]=+j.openInterest||0;}
+      }catch(e){}
+    }));
+  }
   return out;
 }
 async function loadBybit() {
@@ -168,17 +190,18 @@ async function loadOKX() {
 // FUNDING RATE + LONG/SHORT RATIO
 // ============================================================================
 
-// Binance Funding Rate — батч топ-60 по объёму
+// Binance Funding Rate — один запрос на все символы
 async function loadBinanceFunding(symbols) {
   const out = {};
-  await Promise.all(symbols.slice(0,60).map(async sym => {
-    try {
-      const r = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${sym}USDT`);
-      if (!r.ok) return;
-      const j = await r.json();
-      out[sym] = { rate: +j.lastFundingRate * 100, nextTime: +j.nextFundingTime };
-    } catch(e) {}
-  }));
+  try {
+    const r = await fetch('https://fapi.binance.com/fapi/v1/premiumIndex');
+    if (!r.ok) return out;
+    const d = await r.json();
+    d.filter(x=>x.symbol.endsWith('USDT')).forEach(x=>{
+      const sym=x.symbol.replace(/USDT$/,'');
+      out[sym]={rate:+x.lastFundingRate*100,nextTime:+x.nextFundingTime};
+    });
+  } catch(e){}
   return out;
 }
 
@@ -199,19 +222,21 @@ async function loadBinanceLSR(symbols) {
   return out;
 }
 
-// Bybit Funding Rate
+// Bybit Funding Rate — данные уже есть в основном тикере, берём из state.coins
 async function loadBybitFunding(symbols) {
   const out = {};
-  await Promise.all(symbols.slice(0,60).map(async sym => {
-    try {
-      const r = await fetch(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${sym}USDT`);
-      if (!r.ok) return;
-      const j = await r.json();
-      if (j.retCode === 0 && j.result.list[0]) {
-        out[sym] = { rate: +j.result.list[0].fundingRate * 100, nextTime: +j.result.list[0].nextFundingTime };
-      }
-    } catch(e) {}
-  }));
+  // Bybit отдаёт fundingRate в основном тикере /v5/market/tickers — уже загружен
+  // Делаем один дополнительный запрос для точных данных о следующем времени
+  try {
+    const r = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+    if (!r.ok) return out;
+    const j = await r.json();
+    if (j.retCode !== 0) return out;
+    j.result.list.filter(x=>x.symbol.endsWith('USDT')).forEach(x=>{
+      const sym=x.symbol.replace(/USDT$/,'');
+      out[sym]={rate:+x.fundingRate*100,nextTime:+x.nextFundingTime};
+    });
+  } catch(e){}
   return out;
 }
 
@@ -234,8 +259,8 @@ async function loadOKXFunding() {
 
 // Запускаем фоновую загрузку funding + L/S каждые 30 секунд (данные обновляются редко)
 async function refreshFundingAndLSR() {
-  const binSyms = [...state.coins.values()].filter(c=>c.exchange==='Binance').sort((a,b)=>b.volume-a.volume).slice(0,60).map(c=>c.symbol);
-  const bybSyms = [...state.coins.values()].filter(c=>c.exchange==='Bybit').sort((a,b)=>b.volume-a.volume).slice(0,60).map(c=>c.symbol);
+  const binSyms = [...state.coins.values()].filter(c=>c.exchange==='Binance').map(c=>c.symbol);
+  const bybSyms = [...state.coins.values()].filter(c=>c.exchange==='Bybit').map(c=>c.symbol);
 
   const [binF, binLS, bybF, okxF] = await Promise.allSettled([
     loadBinanceFunding(binSyms),
@@ -308,12 +333,20 @@ function updateConnRowFromState(){
 async function refreshBinance(){
   const r=await loadBinance(); processResult(r);
   if(r.ok){
-    const syms=[...state.coins.values()].filter(c=>c.exchange==='Binance').sort((a,b)=>b.volume-a.volume).slice(0,60).map(c=>c.symbol);
-    loadBinanceOI(syms).then(oiMap=>{
-      const t=Date.now();
-      Object.entries(oiMap).forEach(([s,oi])=>{const k=keyFor('Binance',s);const rc=state.coins.get(k);if(rc){rc.oi=oi*rc.price;pushHistory(k,t,rc.price,rc.oi);}});
-      render(); renderOiChart();
-    });
+    // Догружаем OI только для монет у которых он всё ещё 0 (v2 не вернул)
+    const missingOI=[...state.coins.values()]
+      .filter(c=>c.exchange==='Binance'&&(!c.oi||c.oi===0))
+      .map(c=>c.symbol);
+    if(missingOI.length>0){
+      loadBinanceOI(missingOI).then(oiMap=>{
+        const t=Date.now();
+        Object.entries(oiMap).forEach(([s,oi])=>{
+          const k=keyFor('Binance',s);const rc=state.coins.get(k);
+          if(rc&&oi>0){rc.oi=oi*rc.price;pushHistory(k,t,rc.price,rc.oi);}
+        });
+        render(); renderOiChart();
+      });
+    }
   }
 }
 async function refreshBybit(){ processResult(await loadBybit()); }
@@ -606,7 +639,7 @@ function getCoins(){
     if(!state.selectedExchanges.has(c.exchange.toLowerCase()))return false;
     if(srch&&!c.symbol.includes(srch))return false;
     if(c.volume<minVol)return false;
-    if(c.oi<minOI)return false;
+    if(minOI>0 && c.oi<minOI)return false;  // фильтруем по OI только если порог > 0
     return true;
   }).map(c=>{
     const cols=state.colTFs.map(tf=>{
@@ -882,11 +915,66 @@ function drawLineChart(canvas,pts,label,color){
 // ============================================================================
 function populateOiSelect(list){
   const sel=$('oiSymbolSelect');
-  const withOi=list.filter(c=>c.oi>0).slice(0,200);
-  sel.innerHTML=withOi.map(c=>`<option value="${c.key}">${c.symbol} · ${c.exchange}</option>`).join('')||`<option value="">Нет данных OI</option>`;
-  if(state.oiSelectedKey&&withOi.some(c=>c.key===state.oiSelectedKey))sel.value=state.oiSelectedKey;
-  else if(withOi.length){state.oiSelectedKey=withOi[0].key;sel.value=withOi[0].key;}
+  const all=[...state.coins.values()].sort((a,b)=>b.volume-a.volume);
+  const srch=(state.oiSearch||'').toUpperCase();
+  const filtered=srch?all.filter(c=>c.symbol.includes(srch)):all;
+  sel.innerHTML=filtered.slice(0,300).map(c=>{
+    const oi=c.oi>0?` · $${(c.oi/1e6).toFixed(1)}M`:'';
+    return`<option value="${c.key}">${c.symbol} · ${c.exchange}${oi}</option>`;
+  }).join('')||`<option value="">Нет результатов</option>`;
+  if(state.oiSelectedKey&&filtered.some(c=>c.key===state.oiSelectedKey))sel.value=state.oiSelectedKey;
+  else if(filtered.length){state.oiSelectedKey=filtered[0].key;sel.value=filtered[0].key;}
 }
+// Прямой запрос точного OI с биржи по тикеру
+async function fetchExactOI(key) {
+  const coin=state.coins.get(key); if(!coin)return null;
+  const sym=coin.symbol, ex=coin.exchange;
+  try {
+    if(ex==='Binance'){
+      const r=await fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${sym}USDT`);
+      if(!r.ok)return null;
+      const j=await r.json();
+      return {oi:(+j.openInterest)*coin.price, contracts:+j.openInterest, price:coin.price};
+    }
+    if(ex==='Bybit'){
+      const r=await fetch(`https://api.bybit.com/v5/market/tickers?category=linear&symbol=${sym}USDT`);
+      if(!r.ok)return null;
+      const j=await r.json();
+      if(j.retCode!==0||!j.result.list[0])return null;
+      const oi=+j.result.list[0].openInterest;
+      return {oi:oi*coin.price, contracts:oi, price:coin.price};
+    }
+    if(ex==='OKX'){
+      const r=await fetch(`https://www.okx.com/api/v5/public/open-interest?instId=${sym}-USDT-SWAP`);
+      if(!r.ok)return null;
+      const j=await r.json();
+      if(j.code!=='0'||!j.data[0])return null;
+      const oi=+j.data[0].oiCcy;
+      return {oi:oi*coin.price, contracts:oi, price:coin.price};
+    }
+  } catch(e){return null;}
+  return null;
+}
+
+async function loadAndShowExactOI(key) {
+  const box=$('oiExactBox'); if(!box)return;
+  const coin=state.coins.get(key); if(!coin){box.innerHTML='';return;}
+  box.innerHTML=`<div class="oi-exact-loading">Загружаем точный OI...</div>`;
+  const data=await fetchExactOI(key);
+  if(!data){box.innerHTML=`<div class="oi-exact-err">Не удалось загрузить OI для ${coin.symbol}</div>`;return;}
+  // Сохраняем в state для дальнейшего использования
+  const rec=state.coins.get(key);
+  if(rec){rec.oi=data.oi;pushHistory(key,Date.now(),rec.price,data.oi);}
+  box.innerHTML=`
+    <div class="oi-exact-card">
+      <div class="oi-exact-sym">${coin.symbol} <span class="oi-exact-ex">${coin.exchange}</span></div>
+      <div class="oi-exact-row"><span>OI в $</span><b>$${(data.oi/1e6).toFixed(2)}M</b></div>
+      <div class="oi-exact-row"><span>OI в контрактах</span><b>${data.contracts.toLocaleString('ru-RU',{maximumFractionDigits:0})}</b></div>
+      <div class="oi-exact-row"><span>Цена</span><b>$${data.price.toLocaleString('ru-RU',{maximumFractionDigits:4})}</b></div>
+    </div>`;
+  render(); renderOiChart();
+}
+
 function renderOiChart(){
   const key=state.oiSelectedKey,svg=$('oiSvg'),title=$('oiChartTitle');
   if(!key||!state.history.has(key)){svg.innerHTML='';title.textContent='—';return;}
@@ -917,7 +1005,29 @@ function setBtnSpinning(on){ $('refreshBtn').classList.toggle('icon-spin',on); }
 function wireControls(){
   renderExchangeToggle(); renderPresets(); renderTableHead();
 
-  $('search').addEventListener('input',e=>{state.search=e.target.value;render();});
+  $('search').addEventListener('input', e => {
+    state.search = e.target.value;
+    render();
+    // Если ищем конкретную монету — сразу догружаем её OI напрямую с биржи
+    const srch = e.target.value.toUpperCase().trim();
+    if (srch.length >= 2) {
+      const matches = [...state.coins.values()].filter(c => c.symbol === srch);
+      if (matches.length > 0) {
+        matches.forEach(coin => {
+          // Грузим OI только если его нет или он 0
+          if (!coin.oi || coin.oi === 0) {
+            fetchExactOI(coin.key).then(data => {
+              if (data && data.oi > 0) {
+                coin.oi = data.oi;
+                pushHistory(coin.key, Date.now(), coin.price, data.oi);
+                render();
+              }
+            });
+          }
+        });
+      }
+    }
+  });
   $('minVolume').value=state.minVolume;
   $('minVolume').addEventListener('input',e=>{state.minVolume=+e.target.value||0;saveSettings();render();});
   $('minOI').value=state.minOI;
@@ -944,7 +1054,19 @@ function wireControls(){
   $('spike5').value=state.spike5;$('lblSpike5').textContent=state.spike5.toFixed(1)+'%';
   $('spike5').addEventListener('input',e=>{state.spike5=+e.target.value;$('lblSpike5').textContent=state.spike5.toFixed(1)+'%';saveSettings();renderPresets();});
 
-  $('oiSymbolSelect').addEventListener('change',e=>{state.oiSelectedKey=e.target.value;renderOiChart();});
+  $('oiSymbolSelect').addEventListener('change',e=>{
+    state.oiSelectedKey=e.target.value;
+    renderOiChart();
+    loadAndShowExactOI(e.target.value);
+  });
+  // Поиск в OI панели
+  const oiSearchEl=$('oiSearch');
+  if(oiSearchEl){
+    oiSearchEl.addEventListener('input',e=>{
+      state.oiSearch=e.target.value;
+      populateOiSelect([]);
+    });
+  }
 
   document.querySelectorAll('.mini-tab').forEach(tab=>{
     tab.onclick=()=>{
@@ -1016,7 +1138,16 @@ extraCSS.textContent=`
 .sym-name.chart-trigger{cursor:pointer;color:var(--acc);}
 .sym-name.chart-trigger:hover{text-decoration:underline;}
 
-/* Funding Rate */
+/* OI exact card */
+.oi-exact-card{background:var(--bg-2);border:1px solid var(--line-strong);border-radius:8px;padding:10px 12px;}
+.oi-exact-sym{font-family:var(--font-mono);font-weight:700;font-size:13px;margin-bottom:8px;}
+.oi-exact-ex{color:var(--text-2);font-weight:500;font-size:11px;}
+.oi-exact-row{display:flex;justify-content:space-between;font-size:11px;font-family:var(--font-mono);
+  color:var(--text-1);padding:3px 0;border-bottom:1px solid var(--line);}
+.oi-exact-row:last-child{border-bottom:none;}
+.oi-exact-row b{color:var(--text-0);font-weight:700;}
+.oi-exact-loading{color:var(--text-2);font-size:11px;font-family:var(--font-mono);padding:6px 0;}
+.oi-exact-err{color:var(--down);font-size:11px;font-family:var(--font-mono);padding:6px 0;}
 .fund-cell{text-align:right;padding:8px 10px;}
 .fund-rate{font-family:var(--font-mono);font-size:12px;font-weight:700;
   padding:2px 6px;border-radius:4px;}
